@@ -1,0 +1,20 @@
+[project]
+name = "openbridge"
+version = "0.1.0"
+description = "Bridge ChatGPT Pro/Plus subscriptions to an OpenAI-compatible API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "click>=8.1",
+    "cryptography>=43",
+]
+
+[project.scripts]
+openbridge = "openbridge.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.12,<0.9.0"]
+build-backend = "uv_build"
