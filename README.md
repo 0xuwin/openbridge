@@ -180,10 +180,12 @@ src/openbridge/
 │   ├── browser.py       # Browser-based OAuth flow
 │   └── device.py        # Device-code OAuth flow
 └── server/
-    ├── app.py            # FastAPI application factory
+    ├── app.py            # FastAPI application factory + shared httpx client lifespan
     ├── auth.py           # API key validation middleware
-    ├── proxy.py          # Request forwarding to ChatGPT
-    └── routes.py         # OpenAI-compatible API routes
+    ├── proxy.py          # Upstream request forwarding (proxy_collect / proxy_stream)
+    ├── normalize.py      # Request normalization (Chat Completions → Codex shape)
+    ├── convert.py        # Response conversion (Codex → Chat Completion / SSE chunks)
+    └── routes.py         # Route handlers and model validation
 ```
 
 ## License

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import json
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator, AsyncIterator
 
 import httpx
 
@@ -78,115 +78,86 @@ def _extract_error_detail(resp: httpx.Response) -> Any:
     return data
 
 
-async def proxy_request(
+async def _prepare(
+    cfg: Config, store: Store, client: httpx.AsyncClient
+) -> tuple[str, dict[str, str]]:
+    """Resolve the upstream URL and auth headers, refreshing the token if needed."""
+    tokens = await _ensure_valid_token(cfg, store)
+    return cfg.codex_api_endpoint, _build_upstream_headers(tokens)
+
+
+async def proxy_collect(
     cfg: Config,
     store: Store,
     body: dict[str, Any],
     *,
-    stream: bool = False,
-) -> dict[str, Any] | AsyncIterator[bytes]:
-    """Proxy an API request to the ChatGPT codex endpoint.
+    client: httpx.AsyncClient,
+) -> dict[str, Any]:
+    """POST to the upstream endpoint and return the aggregated response payload."""
+    url, headers = await _prepare(cfg, store, client)
+    return await _non_stream_response(client, url, headers, body)
 
-    Works for both chat/completions and responses API requests.
-    When ``stream=True`` returns an async iterator of raw SSE bytes.
-    Otherwise returns the parsed JSON response.
-    """
-    tokens = await _ensure_valid_token(cfg, store)
-    headers = _build_upstream_headers(tokens)
-    url = cfg.codex_api_endpoint
 
-    if stream:
-        return await _stream_response(url, headers, body)
-    else:
-        return await _non_stream_response(url, headers, body)
+def proxy_stream(
+    cfg: Config,
+    store: Store,
+    body: dict[str, Any],
+    *,
+    client: httpx.AsyncClient,
+) -> AsyncIterator[bytes]:
+    """Return an async iterator of raw SSE bytes from the upstream endpoint."""
+    async def _generate() -> AsyncIterator[bytes]:
+        url, headers = await _prepare(cfg, store, client)
+        async for chunk in _stream_response(client, url, headers, body):
+            yield chunk
+
+    return _generate()
 
 
 async def _non_stream_response(
-    url: str, headers: dict[str, str], body: dict[str, Any]
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], body: dict[str, Any]
 ) -> dict[str, Any]:
-    if body.get("stream") is True:
-        stream_headers = dict(headers)
-        stream_headers["Accept"] = "text/event-stream"
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", url, json=body, headers=stream_headers) as resp:
-                if not resp.is_success:
-                    await resp.aread()
-                    raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
-                return await _collect_sse_response(resp)
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(url, json=body, headers=headers)
+    """POST to the upstream SSE endpoint and aggregate the response.completed payload."""
+    stream_headers = dict(headers)
+    stream_headers["Accept"] = "text/event-stream"
+    async with client.stream("POST", url, json=body, headers=stream_headers) as resp:
         if not resp.is_success:
+            await resp.aread()
             raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
-        return resp.json()  # type: ignore[no-any-return]
+        return await _collect_sse_response(resp)
 
 
-def _finalize_sse_event(
-    event_name: str | None,
-    data_lines: list[str],
-    *,
-    text_deltas: list[str],
-) -> dict[str, Any] | None:
-    if not event_name or not data_lines:
-        return None
+async def iter_sse_events(
+    source: AsyncIterator[bytes],
+) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
+    """Parse a raw SSE byte stream and yield (event_name, payload) pairs.
 
-    payload_text = "\n".join(data_lines)
-    if payload_text == "[DONE]":
-        return None
-
-    try:
-        payload = json.loads(payload_text)
-    except json.JSONDecodeError:
-        return None
-
-    if event_name == "response.output_text.delta" and isinstance(payload, dict):
-        delta = payload.get("delta")
-        if isinstance(delta, str):
-            text_deltas.append(delta)
-        return None
-
-    if event_name == "response.completed":
-        if isinstance(payload, dict) and isinstance(payload.get("response"), dict):
-            response = payload["response"]
-        elif isinstance(payload, dict):
-            response = payload
-        else:
-            return None
-
-        if text_deltas and "output_text" not in response:
-            response["output_text"] = "".join(text_deltas)
-        return response
-
-    if event_name in {"response.failed", "response.incomplete"}:
-        detail = payload
-        if isinstance(payload, dict):
-            detail = payload.get("response", {}).get("error") or payload.get("error") or payload
-        raise UpstreamHTTPError(502, detail)
-
-    return None
-
-
-async def _collect_sse_response(resp: httpx.Response) -> dict[str, Any]:
-    """Consume an upstream SSE response and return the final response payload."""
+    Skips comment lines, malformed events, and non-dict payloads.  The
+    ``[DONE]`` sentinel is consumed silently.  Callers receive only well-formed
+    events so they can focus on business logic.
+    """
     buffer = ""
     event_name: str | None = None
     data_lines: list[str] = []
-    text_deltas: list[str] = []
 
-    async for chunk in resp.aiter_text():
-        buffer += chunk
+    async for chunk in source:
+        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
+        buffer += text
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
             line = line.rstrip("\r")
 
             if not line:
-                completed = _finalize_sse_event(
-                    event_name,
-                    data_lines,
-                    text_deltas=text_deltas,
-                )
-                if completed is not None:
-                    return completed
+                # blank line → dispatch accumulated event
+                if event_name and data_lines:
+                    payload_text = "\n".join(data_lines)
+                    if payload_text != "[DONE]":
+                        try:
+                            payload = json.loads(payload_text)
+                        except json.JSONDecodeError:
+                            payload = None
+                        if isinstance(payload, dict):
+                            yield event_name, payload
                 event_name = None
                 data_lines = []
                 continue
@@ -195,32 +166,57 @@ async def _collect_sse_response(resp: httpx.Response) -> dict[str, Any]:
                 continue
             if line.startswith("event:"):
                 event_name = line[6:].strip()
-                continue
-            if line.startswith("data:"):
+            elif line.startswith("data:"):
                 data_lines.append(line[5:].lstrip())
 
-    completed = _finalize_sse_event(event_name, data_lines, text_deltas=text_deltas)
-    if completed is not None:
-        return completed
+    # flush any trailing event not terminated by a blank line
+    if event_name and data_lines:
+        payload_text = "\n".join(data_lines)
+        if payload_text != "[DONE]":
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                yield event_name, payload
+
+
+async def _collect_sse_response(resp: httpx.Response) -> dict[str, Any]:
+    """Consume an upstream SSE response and return the final response payload."""
+    text_deltas: list[str] = []
+
+    async for event_name, payload in iter_sse_events(resp.aiter_bytes()):
+        if event_name == "response.output_text.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                text_deltas.append(delta)
+
+        elif event_name == "response.completed":
+            inner = payload.get("response")
+            response: dict[str, Any] = inner if isinstance(inner, dict) else payload
+            if text_deltas and "output_text" not in response:  # type: ignore[operator]
+                response["output_text"] = "".join(text_deltas)
+            return response  # type: ignore[return-value]
+
+        elif event_name in {"response.failed", "response.incomplete"}:
+            detail = payload.get("response", {}).get("error") or payload.get("error") or payload
+            raise UpstreamHTTPError(502, detail)
 
     raise UpstreamHTTPError(502, "Upstream stream ended before sending response.completed")
 
 
-async def _stream_response(
-    url: str, headers: dict[str, str], body: dict[str, Any]
+def _stream_response(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], body: dict[str, Any]
 ) -> AsyncIterator[bytes]:
-    """Stream the upstream SSE response, yielding raw bytes."""
-
-    stream_headers = dict(headers)
-    stream_headers["Accept"] = "text/event-stream"
+    """Return an async iterator that streams raw SSE bytes from upstream."""
+    stream_headers = {**headers, "Accept": "text/event-stream"}
 
     async def _generate() -> AsyncIterator[bytes]:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=10)) as client:
-            async with client.stream("POST", url, json=body, headers=stream_headers) as resp:
-                if not resp.is_success:
-                    await resp.aread()
-                    raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+        async with client.stream("POST", url, json=body, headers=stream_headers) as resp:
+            if not resp.is_success:
+                await resp.aread()
+                raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
+            async for chunk in resp.aiter_bytes():
+                yield chunk
 
     return _generate()

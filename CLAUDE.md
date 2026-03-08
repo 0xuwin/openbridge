@@ -45,13 +45,15 @@ src/openbridge/
 │   ├── browser.py   # Browser OAuth flow (localhost callback server)
 │   └── device.py    # Headless device-code OAuth flow
 └── server/          # FastAPI-based OpenAI-compatible API server
-    ├── app.py       # Application factory; attaches Config + Store to app.state
+    ├── app.py       # Application factory; lifespan manages shared httpx.AsyncClient
     ├── auth.py      # Bearer token validation (hashes incoming key, checks store)
-    ├── proxy.py     # Forwards requests to ChatGPT codex endpoint; handles token refresh
-    └── routes.py    # /v1/chat/completions, /v1/responses, /v1/models
+    ├── proxy.py     # Upstream forwarding: proxy_collect / proxy_stream / iter_sse_events
+    ├── normalize.py # Request normalization: Chat Completions + Responses API → Codex shape
+    ├── convert.py   # Response conversion: Codex payload → chat.completion / SSE chunks
+    └── routes.py    # Route handlers (_CODEX_MODELS, _validate_model, /v1/* endpoints)
 ```
 
-**Key data flow:** Client request (with `ob-` API key) -> `auth.py` validates key -> `routes.py` parses request -> `proxy.py` adds OAuth token + rewrites URL -> ChatGPT backend -> response streamed back to client.
+**Key data flow:** Client request (with `ob-` API key) → `auth.py` validates key → `routes.py` dispatches → `normalize.py` adapts request → `proxy.py` adds OAuth token + calls Codex upstream → `convert.py` transforms response → client receives OpenAI-compatible output.
 
 ## Code Conventions
 
@@ -79,5 +81,7 @@ Edit the `_CODEX_MODELS` set in `src/openbridge/server/routes.py`.
 ## Adding New API Endpoints
 
 1. Add the route handler in `src/openbridge/server/routes.py` on the existing `router`
-2. If it needs upstream proxying, add a corresponding function in `src/openbridge/server/proxy.py`
-3. All routes on `router` automatically require API key auth via the `verify_api_key` dependency
+2. If the request body needs adapting, add a normalization function in `src/openbridge/server/normalize.py`
+3. If the response needs transforming, add a conversion function in `src/openbridge/server/convert.py`
+4. If it needs upstream proxying, use `proxy_collect` or `proxy_stream` from `src/openbridge/server/proxy.py`
+5. All routes on `router` automatically require API key auth via the `verify_api_key` dependency
