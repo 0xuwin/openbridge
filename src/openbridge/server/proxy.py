@@ -108,7 +108,7 @@ async def proxy_stream(
 ) -> AsyncIterator[bytes]:
     """Return an async iterator of raw SSE bytes from the upstream endpoint."""
     url, headers = await _prepare(cfg, store, client)
-    return _stream_response(client, url, headers, body)
+    return await _stream_response(client, url, headers, body)
 
 
 async def _non_stream_response(
@@ -210,18 +210,23 @@ async def _collect_sse_response(resp: httpx.Response) -> dict[str, Any]:
     raise UpstreamHTTPError(502, "Upstream stream ended before sending response.completed")
 
 
-def _stream_response(
+async def _stream_response(
     client: httpx.AsyncClient, url: str, headers: dict[str, str], body: dict[str, Any]
 ) -> AsyncIterator[bytes]:
     """Return an async iterator that streams raw SSE bytes from upstream."""
     stream_headers = {**headers, "Accept": "text/event-stream"}
+    stream = client.stream("POST", url, json=body, headers=stream_headers)
+    resp = await stream.__aenter__()
+    if not resp.is_success:
+        await resp.aread()
+        await stream.__aexit__(None, None, None)
+        raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
 
     async def _generate() -> AsyncIterator[bytes]:
-        async with client.stream("POST", url, json=body, headers=stream_headers) as resp:
-            if not resp.is_success:
-                await resp.aread()
-                raise UpstreamHTTPError(resp.status_code, _extract_error_detail(resp))
+        try:
             async for chunk in resp.aiter_bytes():
                 yield chunk
+        finally:
+            await stream.__aexit__(None, None, None)
 
     return _generate()
