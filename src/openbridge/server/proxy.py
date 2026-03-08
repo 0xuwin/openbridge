@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import logging
 import json
 import time
@@ -98,7 +99,7 @@ async def proxy_collect(
     return await _non_stream_response(client, url, headers, body)
 
 
-def proxy_stream(
+async def proxy_stream(
     cfg: Config,
     store: Store,
     body: dict[str, Any],
@@ -106,12 +107,8 @@ def proxy_stream(
     client: httpx.AsyncClient,
 ) -> AsyncIterator[bytes]:
     """Return an async iterator of raw SSE bytes from the upstream endpoint."""
-    async def _generate() -> AsyncIterator[bytes]:
-        url, headers = await _prepare(cfg, store, client)
-        async for chunk in _stream_response(client, url, headers, body):
-            yield chunk
-
-    return _generate()
+    url, headers = await _prepare(cfg, store, client)
+    return _stream_response(client, url, headers, body)
 
 
 async def _non_stream_response(
@@ -139,9 +136,13 @@ async def iter_sse_events(
     buffer = ""
     event_name: str | None = None
     data_lines: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
 
     async for chunk in source:
-        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
+        if isinstance(chunk, str):
+            text = chunk
+        else:
+            text = decoder.decode(chunk)
         buffer += text
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
@@ -168,6 +169,10 @@ async def iter_sse_events(
                 event_name = line[6:].strip()
             elif line.startswith("data:"):
                 data_lines.append(line[5:].lstrip())
+
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        buffer += tail
 
     # flush any trailing event not terminated by a blank line
     if event_name and data_lines:

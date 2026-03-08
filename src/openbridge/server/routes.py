@@ -86,12 +86,25 @@ def _get_proxy_deps(request: Request) -> tuple[Any, Any, httpx.AsyncClient]:
     return request.app.state.config, request.app.state.store, request.app.state.http_client
 
 
-def _proxy_stream(request: Request, body: dict[str, Any]) -> AsyncIterator[bytes]:
+async def _proxy_stream(request: Request, body: dict[str, Any]) -> AsyncIterator[bytes]:
     """Validate model, force upstream stream, and return a raw SSE byte iterator."""
     _validate_model(body)
     cfg, store, http_client = _get_proxy_deps(request)
     body["stream"] = True
-    return proxy_stream(cfg, store, body, client=http_client)
+    try:
+        return await proxy_stream(cfg, store, body, client=http_client)
+    except UpstreamHTTPError as exc:
+        logger.warning("Upstream request failed with status %s", exc.status_code)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except RuntimeError as exc:
+        logger.error("Proxy error: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except httpx.HTTPError as exc:
+        logger.exception("HTTP error proxying request")
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected error proxying request")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 async def _proxy_collect(request: Request, body: dict[str, Any]) -> dict[str, Any]:
@@ -134,7 +147,7 @@ async def chat_completions(request: Request) -> Any:
     normalized = normalize_chat_completions_body(body)
     if bool(normalized.get("stream")):
         chunks = responses_stream_to_chat_chunks(
-            _proxy_stream(request, normalized),
+            await _proxy_stream(request, normalized),
             requested_model=body.get("model", ""),
         )
         return _sse_response(chunks)
@@ -164,7 +177,7 @@ async def responses(request: Request) -> Any:
 
     normalized = normalize_responses_body(body)
     if bool(normalized.get("stream")):
-        return _sse_response(_proxy_stream(request, normalized))
+        return _sse_response(await _proxy_stream(request, normalized))
 
     result = await _proxy_collect(request, normalized)
     return JSONResponse(content=result)
